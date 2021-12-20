@@ -687,6 +687,29 @@ nvm_normalize_version() {
   }' "${1#v}"
 }
 
+nvm_normalize_lts() {
+  local LTS
+  LTS="${1-}"
+
+  if [ "$(expr "${LTS}" : '^lts/-[1-9][0-9]*$')" -gt 0 ]; then
+    local N
+    N="$(echo "${LTS}" | cut -d '-' -f 2)"
+    N=$((N+1))
+    local NVM_ALIAS_DIR
+    NVM_ALIAS_DIR="$(nvm_alias_path)"
+    local RESULT
+    RESULT="$(command ls "${NVM_ALIAS_DIR}/lts" | command tail -n "${N}" | command head -n 1)"
+    if [ "${RESULT}" != '*' ]; then
+      nvm_echo "lts/${RESULT}"
+    else
+      nvm_err 'That many LTS releases do not exist yet.'
+      return 2
+    fi
+  else
+    nvm_echo "${LTS}"
+  fi
+}
+
 nvm_ensure_version_prefix() {
   local NVM_VERSION
   NVM_VERSION="$(nvm_strip_iojs_prefix "${1-}" | command sed -e 's/^\([0-9]\)/v\1/g')"
@@ -988,6 +1011,11 @@ nvm_list_aliases() {
   NVM_ALIAS_DIR="$(nvm_alias_path)"
   command mkdir -p "${NVM_ALIAS_DIR}/lts"
 
+  if [ "${ALIAS}" != "${ALIAS#lts/}" ]; then
+    nvm_alias "${ALIAS}"
+    return $?
+  fi
+
   nvm_is_zsh && unsetopt local_options nomatch
   (
     local ALIAS_PATH
@@ -1038,27 +1066,14 @@ nvm_alias() {
     nvm_err 'An alias is required.'
     return 1
   fi
+  ALIAS="$(nvm_normalize_lts "${ALIAS}")"
 
-  local NVM_ALIAS_DIR
-  NVM_ALIAS_DIR="$(nvm_alias_path)"
-
-  if [ "$(expr "${ALIAS}" : '^lts/-[1-9][0-9]*$')" -gt 0 ]; then
-    local N
-    N="$(echo "${ALIAS}" | cut -d '-' -f 2)"
-    N=$((N+1))
-    local RESULT
-    RESULT="$(command ls "${NVM_ALIAS_DIR}/lts" | command tail -n "${N}" | command head -n 1)"
-    if [ "${RESULT}" != '*' ]; then
-      nvm_alias "lts/${RESULT}"
-      return $?
-    else
-      nvm_err 'That many LTS releases do not exist yet.'
-      return 2
-    fi
+  if [ -z "${ALIAS}" ]; then
+    return 2
   fi
 
   local NVM_ALIAS_PATH
-  NVM_ALIAS_PATH="${NVM_ALIAS_DIR}/${ALIAS}"
+  NVM_ALIAS_PATH="$(nvm_alias_path)/${ALIAS}"
   if [ ! -f "${NVM_ALIAS_PATH}" ]; then
     nvm_err 'Alias does not exist.'
     return 2
@@ -1449,6 +1464,11 @@ nvm_ls_remote_index_tab() {
     done; } << EOF
 $VERSION_LIST
 EOF
+
+  if [ -n "${LTS-}" ]; then
+    LTS="$(nvm_normalize_lts "lts/${LTS}")"
+    LTS="${LTS#lts/}"
+  fi
 
   VERSIONS="$({ command awk -v lts="${LTS-}" '{
         if (!$1) { next }
@@ -1951,19 +1971,7 @@ nvm_install_binary_extract() {
     command unzip -q "${TARBALL}" -d "${TMPDIR}" || return 1
   # For non Windows system (including WSL running on Windows)
   else
-    local tar_compression_flag
-    tar_compression_flag='z'
-    if nvm_supports_xz "${VERSION}"; then
-      tar_compression_flag='J'
-    fi
-
-    local tar
-    if [ "${NVM_OS}" = 'aix' ]; then
-      tar='gtar'
-    else
-      tar='tar'
-    fi
-    command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" --strip-components 1 || return 1
+    nvm_extract_tarball "${NVM_OS}" "${VERSION}" "${TARBALL}" "${TMPDIR}"
   fi
 
   command mkdir -p "${VERSION_PATH}" || return 1
@@ -2231,6 +2239,48 @@ nvm_download_artifact() {
   nvm_echo "${TARBALL}"
 }
 
+# args: nvm_os, version, tarball, tmpdir
+nvm_extract_tarball() {
+  if [ "$#" -ne 4 ]; then
+    nvm_err 'nvm_extract_tarball requires exactly 4 arguments'
+    return 5
+  fi
+
+  local NVM_OS
+  NVM_OS="${1-}"
+
+  local VERSION
+  VERSION="${2-}"
+
+  local TARBALL
+  TARBALL="${3-}"
+
+  local TMPDIR
+  TMPDIR="${4-}"
+
+  local tar_compression_flag
+  tar_compression_flag='z'
+  if nvm_supports_xz "${VERSION}"; then
+    tar_compression_flag='J'
+  fi
+
+  local tar
+  tar='tar'
+  if [ "${NVM_OS}" = 'aix' ]; then
+    tar='gtar'
+  fi
+
+  if [ "${NVM_OS}" = 'openbsd' ]; then
+    if [ "${tar_compression_flag}" = 'J' ]; then
+      command xzcat "${TARBALL}" | "${tar}" -xf - -C "${TMPDIR}" -s '/[^\/]*\///' || return 1
+    else
+      command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" -s '/[^\/]*\///' || return 1
+    fi
+  else
+    command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" --strip-components 1 || return 1
+  fi
+}
+
 nvm_get_make_jobs() {
   if nvm_is_natural_num "${1-}"; then
     NVM_MAKE_JOBS="$1"
@@ -2342,18 +2392,6 @@ nvm_install_source() {
     fi
   fi
 
-  local tar_compression_flag
-  tar_compression_flag='z'
-  if nvm_supports_xz "${VERSION}"; then
-    tar_compression_flag='J'
-  fi
-
-  local tar
-  tar='tar'
-  if [ "${NVM_OS}" = 'aix' ]; then
-    tar='gtar'
-  fi
-
   local TARBALL
   local TMPDIR
   local VERSION_PATH
@@ -2373,7 +2411,7 @@ nvm_install_source() {
   if ! (
     # shellcheck disable=SC2086
     command mkdir -p "${TMPDIR}" && \
-    command "${tar}" -x${tar_compression_flag}f "${TARBALL}" -C "${TMPDIR}" --strip-components 1 && \
+    nvm_extract_tarball "${NVM_OS}" "${VERSION}" "${TARBALL}" "${TMPDIR}" && \
     VERSION_PATH="$(nvm_version_path "${PREFIXED_VERSION}")" && \
     nvm_cd "${TMPDIR}" && \
     nvm_echo '$>'./configure --prefix="${VERSION_PATH}" $ADDITIONAL_PARAMETERS'<' && \
@@ -3797,8 +3835,14 @@ nvm() {
               PATTERN="${1-}"
               if [ -z "${NVM_LTS-}" ]; then
                 case "${PATTERN}" in
-                  'lts/*') NVM_LTS='*' ;;
-                  lts/*) NVM_LTS="${PATTERN##lts/}" ;;
+                  'lts/*')
+                    NVM_LTS='*'
+                    PATTERN=''
+                  ;;
+                  lts/*)
+                    NVM_LTS="${PATTERN##lts/}"
+                    PATTERN=''
+                  ;;
                 esac
               fi
             fi
@@ -4081,7 +4125,7 @@ nvm() {
       NVM_VERSION_ONLY=true NVM_LTS="${NVM_LTS-}" nvm_remote_version "${PATTERN:-node}"
     ;;
     "--version" | "-v")
-      nvm_echo '0.39.0'
+      nvm_echo '0.39.1'
     ;;
     "unload")
       nvm deactivate >/dev/null 2>&1
@@ -4103,7 +4147,7 @@ nvm() {
         nvm_resolve_alias nvm_ls_current nvm_alias \
         nvm_binary_available nvm_change_path nvm_strip_path \
         nvm_num_version_groups nvm_format_version nvm_ensure_version_prefix \
-        nvm_normalize_version nvm_is_valid_version \
+        nvm_normalize_version nvm_is_valid_version nvm_normalize_lts \
         nvm_ensure_version_installed nvm_cache_dir \
         nvm_version_path nvm_alias_path nvm_version_dir \
         nvm_find_nvmrc nvm_find_up nvm_find_project_dir nvm_tree_contains_path \
@@ -4125,7 +4169,7 @@ nvm() {
         nvm_npmrc_bad_news_bears \
         nvm_get_colors nvm_set_colors nvm_print_color_code nvm_format_help_message_colors \
         nvm_echo_with_colors nvm_err_with_colors \
-        nvm_get_artifact_compression nvm_install_binary_extract \
+        nvm_get_artifact_compression nvm_install_binary_extract nvm_extract_tarball \
         >/dev/null 2>&1
       unset NVM_RC_VERSION NVM_NODEJS_ORG_MIRROR NVM_IOJS_ORG_MIRROR NVM_DIR \
         NVM_CD_FLAGS NVM_BIN NVM_INC NVM_MAKE_JOBS \
